@@ -4,6 +4,7 @@ package github
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -14,7 +15,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
+	"ghreport/internal/cache"
 	"ghreport/internal/trace"
 )
 
@@ -45,6 +48,7 @@ type Options struct {
 	Token   string
 
 	HTTPClient        *http.Client  // таймаут запроса; CheckRedirect будет заменён
+	Cache             *cache.Store  // nil — без кэша
 	Trace             *trace.Writer // nil — журнал не ведётся
 	Logf              func(format string, args ...any)
 	Sleep             func(ctx context.Context, d time.Duration) error
@@ -60,6 +64,7 @@ type Client struct {
 	token   string
 
 	http              *http.Client
+	cache             *cache.Store
 	trace             *trace.Writer
 	logf              func(format string, args ...any)
 	sleep             func(ctx context.Context, d time.Duration) error
@@ -75,6 +80,7 @@ func NewClient(opts Options) *Client {
 	c := &Client{
 		baseURL:           opts.BaseURL,
 		token:             opts.Token,
+		cache:             opts.Cache,
 		trace:             opts.Trace,
 		logf:              opts.Logf,
 		sleep:             opts.Sleep,
@@ -123,9 +129,10 @@ func NewClient(opts Options) *Client {
 
 // reply — ответ сервера с прочитанным телом.
 type reply struct {
-	status int
-	header http.Header
-	body   []byte
+	status    int
+	header    http.Header
+	body      []byte
+	fromCache bool // 304: тело взято из кэша, status заменён на 200
 }
 
 // get выполняет GET с переходами по редиректам и возвращает успешный ответ 2xx
@@ -146,6 +153,9 @@ func (c *Client) get(ctx context.Context, rawURL string) (*reply, string, error)
 		case r.status >= 200 && r.status < 300:
 			if len(r.body) > maxBodySize {
 				return nil, "", errorf(CodeInvalidResponse, "%s: ответ больше %d байт", target, maxBodySize)
+			}
+			if !r.fromCache {
+				c.remember(target, r)
 			}
 			return r, target, nil
 		case isRedirect(r.status):
@@ -177,13 +187,16 @@ func (c *Client) get(ctx context.Context, rawURL string) (*reply, string, error)
 
 // do выполняет запрос к одному адресу. Сетевые ошибки и 5xx повторяются с
 // паузами retryDelays, при исчерпании лимита клиент ждёт его восстановления.
-// Остальные ответы, включая редиректы и ошибки 4xx, возвращаются как есть.
+// Если адрес есть в кэше, отправляется If-None-Match, а на 304 возвращается
+// сохранённое тело. Остальные ответы, включая редиректы и ошибки 4xx,
+// возвращаются как есть.
 func (c *Client) do(ctx context.Context, u *url.URL) (*reply, error) {
 	target := u.String()
 	retries, waits := 0, 0
 	for attempt := 1; ; attempt++ {
+		cached, hasCached := c.cache.Get(target)
 		started := c.now()
-		r, err := c.send(ctx, u)
+		r, err := c.send(ctx, u, cached.ETag)
 		if err != nil {
 			status := 0
 			if r != nil {
@@ -202,9 +215,18 @@ func (c *Client) do(ctx context.Context, u *url.URL) (*reply, error) {
 			retries++
 			continue
 		}
-		c.record(started, target, r.status, attempt, false, "")
+		notModified := r.status == http.StatusNotModified
+		c.record(started, target, r.status, attempt, notModified && hasCached, "")
 
 		switch {
+		case notModified && hasCached:
+			header := r.header.Clone()
+			if header.Get("Link") == "" && cached.Link != "" {
+				header.Set("Link", cached.Link) // GitHub отвечает 304 без Link
+			}
+			return &reply{status: http.StatusOK, header: header, body: []byte(cached.Body), fromCache: true}, nil
+		case notModified:
+			return nil, errorf(CodeInvalidResponse, "%s: 304 Not Modified на запрос без If-None-Match", target)
 		case isRateLimited(r):
 			if waits == c.maxRateLimitWaits {
 				return nil, errorf(CodeRateLimited, "%s: лимит запросов исчерпан, ожиданий: %d", target, waits)
@@ -235,7 +257,7 @@ func (c *Client) do(ctx context.Context, u *url.URL) (*reply, error) {
 }
 
 // send выполняет одну попытку. При ошибке чтения тела возвращает и ответ, и ошибку.
-func (c *Client) send(ctx context.Context, u *url.URL) (*reply, error) {
+func (c *Client) send(ctx context.Context, u *url.URL, etag string) (*reply, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
 		return nil, err
@@ -245,6 +267,9 @@ func (c *Client) send(ctx context.Context, u *url.URL) (*reply, error) {
 	req.Header.Set("X-GitHub-Api-Version", APIVersion)
 	if c.token != "" && c.isBaseHost(u) {
 		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	if etag != "" {
+		req.Header.Set("If-None-Match", etag)
 	}
 
 	resp, err := c.http.Do(req)
@@ -260,6 +285,26 @@ func (c *Client) send(ctx context.Context, u *url.URL) (*reply, error) {
 // только туда отправляется токен.
 func (c *Client) isBaseHost(u *url.URL) bool {
 	return u.Scheme == c.base.Scheme && strings.EqualFold(u.Host, c.base.Host)
+}
+
+// remember сохраняет успешный ответ с ETag в кэш. Ответ без ETag или с телом,
+// которое не является JSON в UTF-8, удаляет устаревшую запись.
+func (c *Client) remember(target string, r *reply) {
+	etag := r.header.Get("ETag")
+	var err error
+	if etag != "" && utf8.Valid(r.body) && json.Valid(r.body) {
+		err = c.cache.Put(cache.Entry{
+			URL:  target,
+			ETag: etag,
+			Link: strings.Join(r.header.Values("Link"), ", "),
+			Body: string(r.body),
+		})
+	} else {
+		err = c.cache.Delete(target)
+	}
+	if err != nil {
+		c.logf("кэш: %v", err)
+	}
 }
 
 func (c *Client) resolveMoved(target string) string {
