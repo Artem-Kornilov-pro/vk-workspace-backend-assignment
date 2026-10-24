@@ -35,6 +35,11 @@ from urllib.parse import parse_qs
 
 MAX_PER_PAGE = 100
 
+# Запросы самих тестов (server_client.py) — «наблюдатели»: они получают обычные
+# данные (с включёнными поломками), но не попадают в журнал запросов и не
+# расходуют сценарии ошибок, предназначенные для службы.
+OBSERVER_AGENT_PREFIX = "ghreport-api-tests/"
+
 # Поломки сервера для самопроверки набора тестов.
 FAULTS = {
     "skip_item": "на границе страниц пропускается элемент",
@@ -100,22 +105,24 @@ def make_item(repo: str, number: int, created: datetime, rnd: Random, pr: bool) 
     return item
 
 
-def make_items(repo: str, count: int, seed: int, pr_ratio: float = 0.2) -> list:
+def make_items(repo: str, count: int, seed: int, pr_ratio: float = 0.2, midnight: bool = False) -> list:
     """Элементы в порядке created_at по возрастанию. Иногда несколько элементов
-    создаются в одну секунду — их сервер отдаёт по убыванию number. Один элемент
-    создан ровно в полночь UTC, чтобы проверить границу --since."""
+    создаются в одну секунду — их сервер отдаёт по убыванию number. При midnight
+    в середине есть issue, созданный ровно в полночь UTC (граница --since)."""
     rnd = Random(seed)
     created = datetime(2025, 3, 1, 8, 0, 0, tzinfo=timezone.utc)
     items: list = []
     number = 0
     while len(items) < count:
-        if len(items) == count // 2:
+        if midnight and len(items) >= count // 2:
+            midnight = False
             created = (created + timedelta(days=1)).replace(hour=0, minute=0, second=0)
-        else:
-            created += timedelta(hours=rnd.randint(1, 30), minutes=rnd.randint(0, 59),
-                                 seconds=rnd.randint(1, 59))
+            number += 1
+            items.append(make_item(repo, number, created, rnd, pr=False))
+            continue
+        created += timedelta(hours=rnd.randint(1, 30), minutes=rnd.randint(0, 59), seconds=rnd.randint(1, 59))
         group = []
-        for _ in range(1 if rnd.random() < 0.85 else rnd.randint(2, 3)):
+        for _ in range(1 if not items or rnd.random() < 0.85 else rnd.randint(2, 3)):
             number += 1
             group.append(make_item(repo, number, created, rnd, rnd.random() < pr_ratio))
         items.extend(reversed(group))
@@ -124,7 +131,7 @@ def make_items(repo: str, count: int, seed: int, pr_ratio: float = 0.2) -> list:
 
 def default_repos() -> dict:
     return {
-        "mock/main": make_items("mock/main", 260, seed=7),
+        "mock/main": make_items("mock/main", 260, seed=7, midnight=True),
         "mock/small": make_items("mock/small", 7, seed=11, pr_ratio=0.3),
         "mock/second": make_items("mock/second", 40, seed=13),
         "mock/empty": [],
@@ -165,7 +172,7 @@ class MockServer:
     """Контрактный сервер в отдельном потоке.
 
     Состояние для тестов:
-      requests      — все полученные запросы по порядку;
+      requests      — все запросы службы по порядку (без запросов самих тестов);
       max_inflight  — наибольшее число одновременно обрабатываемых запросов;
       issued_links  — выданные адреса rel="next" в порядке выдачи.
     """
@@ -247,18 +254,20 @@ class MockServer:
             url=f"http://{h.headers.get('Host', '')}{target}",
             time=time.monotonic(),
         )
+        observer = req.headers.get("user-agent", "").startswith(OBSERVER_AGENT_PREFIX)
         with self._lock:
-            self.requests.append(req)
+            if not observer:
+                self.requests.append(req)
             self._inflight += 1
             self.max_inflight = max(self.max_inflight, self._inflight)
         try:
-            reply = self._route(req, f"http://{h.headers.get('Host', '')}")
+            reply = self._route(req, f"http://{h.headers.get('Host', '')}", observer)
             self._send(h, reply)
         finally:
             with self._lock:
                 self._inflight -= 1
 
-    def _route(self, req: Request, origin: str) -> Reply:
+    def _route(self, req: Request, origin: str, observer: bool = False) -> Reply:
         if req.method != "GET":
             return json_reply(405, {"message": "Method Not Allowed"})
         if self.require_token is not None and \
@@ -269,6 +278,10 @@ class MockServer:
         if isinstance(target, Reply):
             return target
         repo, offset, per_page = target
+        if observer:
+            if repo not in self.repos:
+                return json_reply(404, {"message": "Not Found"})
+            return self._page(req, origin, repo, offset, per_page, observer)
 
         with self._lock:
             index = self._repo_requests[repo]
@@ -332,7 +345,8 @@ class MockServer:
             with self._lock:
                 self._not_before[repo] = (time.monotonic() + wait, reply)
 
-    def _page(self, req: Request, origin: str, repo: str, offset: int, per_page: int) -> Reply:
+    def _page(self, req: Request, origin: str, repo: str, offset: int, per_page: int,
+              observer: bool = False) -> Reply:
         items = self.repos[repo]
         if "sort_desc" in self.faults:
             items = list(reversed(items))
@@ -355,8 +369,9 @@ class MockServer:
                 first = f"{origin}/_cursor/{_encode_cursor(repo, 0, per_page)}"
                 links.append(f'<{first}>; rel="first"')
             headers["Link"] = ", ".join(links)
-            with self._lock:
-                self.issued_links.append(next_url)
+            if not observer:
+                with self._lock:
+                    self.issued_links.append(next_url)
 
         etag = 'W/"' + hashlib.sha1((body + headers.get("Link", "")).encode()).hexdigest()[:24] + '"'
         headers["ETag"] = etag

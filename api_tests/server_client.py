@@ -218,3 +218,28 @@ def sort_key(issue: dict):
 def expected_issues(walk: Walk, limit: int, since: Optional[datetime] = None) -> list:
     walk.ensure_issues(limit, since)
     return sorted((report_issue(it) for it in select_issues(walk.items, limit, since)), key=sort_key)
+
+
+def tie_safe_limit(issues: list, desired: int) -> int:
+    """Наибольший limit ≤ desired, который не разрезает группу issue с одинаковым
+    created_at: при разрезе контракт допускает разный выбор элементов внутри группы."""
+    def splits(k):
+        return 0 < k < len(issues) and issues[k - 1]["created_at"] == issues[k]["created_at"]
+
+    limit = min(desired, len(issues))
+    while splits(limit):
+        limit -= 1
+    if limit == 0 and issues:  # вся первая группа длиннее desired — берём её целиком
+        limit = 1
+        while splits(limit):
+            limit += 1
+    return limit
+
+
+def unique_numbers(items: list) -> list:
+    seen, out = set(), []
+    for it in items:
+        if it["number"] not in seen:
+            seen.add(it["number"])
+            out.append(it["number"])
+    return out
