@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -167,5 +169,67 @@ func TestRunHelp(t *testing.T) {
 	code := Run(context.Background(), []string{"--help"}, func(string) string { return "" }, &stdout, &stderr)
 	if code != ExitOK || !strings.Contains(stdout.String(), "--repos") {
 		t.Fatalf("code = %d, stdout = %q", code, stdout.String())
+	}
+}
+
+func TestRunEndToEnd(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/octo/repo/issues":
+			w.Write([]byte(`[{"number": 1, "title": "a", "user": {"login": "u"}, "labels": [{"name": "bug"}],
+				"created_at": "2026-01-05T10:00:00Z", "html_url": "https://github.com/octo/repo/issues/1"}]`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	tracePath := filepath.Join(dir, "trace.jsonl")
+	getenv := func(key string) string {
+		return map[string]string{"GITHUB_API_BASE_URL": srv.URL + "/", "GITHUB_TOKEN": "s3cr3t"}[key]
+	}
+	var stdout, stderr bytes.Buffer
+	args := []string{"--repos", "octo/repo,octo/missing", "--trace", tracePath, "--cache-dir", filepath.Join(dir, "cache")}
+	code := Run(context.Background(), args, getenv, &stdout, &stderr)
+	if code != ExitPartial {
+		t.Fatalf("code = %d, stderr = %s", code, stderr.String())
+	}
+	var rep report.Report
+	if err := json.Unmarshal(stdout.Bytes(), &rep); err != nil {
+		t.Fatal(err)
+	}
+	if rep.Repos[0].Count != 1 || *rep.Repos[1].Error != "not_found" {
+		t.Fatalf("report = %s", stdout.String())
+	}
+
+	data, err := os.ReadFile(tracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("trace = %s", data)
+	}
+	for _, line := range lines {
+		var entry map[string]any
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatal(err)
+		}
+		if len(entry) != 7 {
+			t.Errorf("trace fields = %v", entry)
+		}
+	}
+	if strings.Contains(string(data)+stderr.String(), "s3cr3t") {
+		t.Error("token leaked")
+	}
+}
+
+func TestRunTraceFileError(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	args := []string{"--repos", "a/b", "--trace", filepath.Join(t.TempDir(), "missing", "trace.jsonl")}
+	code := Run(context.Background(), args, func(string) string { return "" }, &stdout, &stderr)
+	if code != ExitUsage || stdout.Len() != 0 || !strings.Contains(stderr.String(), "--trace") {
+		t.Fatalf("code = %d, stdout = %q, stderr = %q", code, stdout.String(), stderr.String())
 	}
 }

@@ -22,7 +22,7 @@ type Query struct {
 // created_at, затем по number.
 func (c *Client) ListIssues(ctx context.Context, repo config.Repo, q Query) ([]report.Issue, error) {
 	pageURL := c.issuesURL(repo)
-	resp, err := c.fetch(ctx, pageURL)
+	resp, _, err := c.get(ctx, pageURL)
 	if err != nil {
 		return nil, err
 	}

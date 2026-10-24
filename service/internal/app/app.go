@@ -14,6 +14,7 @@ import (
 	"ghreport/internal/config"
 	"ghreport/internal/github"
 	"ghreport/internal/report"
+	"ghreport/internal/trace"
 )
 
 // Коды возврата.
@@ -43,8 +44,29 @@ func Run(ctx context.Context, args []string, getenv func(string) string, stdout,
 		return usageError(stderr, err)
 	}
 
-	client := github.NewClient(github.Options{BaseURL: cfg.BaseURL, Token: cfg.Token})
-	return run(ctx, cfg, client, stdout, stderr, time.Now)
+	var journal *trace.Writer
+	if cfg.Trace != "" {
+		f, err := os.Create(cfg.Trace)
+		if err != nil {
+			return usageError(stderr, fmt.Errorf("--trace: %v", err))
+		}
+		defer f.Close()
+		journal = trace.New(f)
+	}
+
+	client := github.NewClient(github.Options{
+		BaseURL: cfg.BaseURL,
+		Token:   cfg.Token,
+		Trace:   journal,
+		Logf: func(format string, args ...any) {
+			fmt.Fprintf(stderr, "ghreport: "+format+"\n", args...)
+		},
+	})
+	code := run(ctx, cfg, client, stdout, stderr, time.Now)
+	if err := journal.Err(); err != nil {
+		fmt.Fprintf(stderr, "ghreport: запись журнала: %v\n", err)
+	}
+	return code
 }
 
 func usageError(stderr io.Writer, err error) int {
