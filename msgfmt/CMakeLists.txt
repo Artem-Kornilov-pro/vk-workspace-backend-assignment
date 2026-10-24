@@ -38,3 +38,6 @@ target_link_libraries(msgfmt_core PUBLIC msgfmt_options)
 
 add_executable(msgfmt src/main.cpp)
 target_link_libraries(msgfmt PRIVATE msgfmt_core)
+
+enable_testing()
+add_subdirectory(tests)
