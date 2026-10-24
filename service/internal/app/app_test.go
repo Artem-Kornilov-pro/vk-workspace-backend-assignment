@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -231,5 +232,52 @@ func TestRunTraceFileError(t *testing.T) {
 	code := Run(context.Background(), args, func(string) string { return "" }, &stdout, &stderr)
 	if code != ExitUsage || stdout.Len() != 0 || !strings.Contains(stderr.String(), "--trace") {
 		t.Fatalf("code = %d, stdout = %q, stderr = %q", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestRunReusesCacheBetweenRuns(t *testing.T) {
+	const body = `[{"number": 1, "created_at": "2026-01-05T10:00:00Z"}]`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"v1"`)
+		if r.Header.Get("If-None-Match") == `"v1"` {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	getenv := func(key string) string {
+		return map[string]string{"GITHUB_API_BASE_URL": srv.URL}[key]
+	}
+	var reports []report.Report
+	for run := 0; run < 2; run++ {
+		tracePath := filepath.Join(dir, "trace.jsonl")
+		var stdout, stderr bytes.Buffer
+		args := []string{"--repos", "octo/repo", "--cache-dir", filepath.Join(dir, "cache"), "--trace", tracePath}
+		if code := Run(context.Background(), args, getenv, &stdout, &stderr); code != ExitOK {
+			t.Fatalf("run %d: code = %d, stderr = %s", run, code, stderr.String())
+		}
+		var rep report.Report
+		if err := json.Unmarshal(stdout.Bytes(), &rep); err != nil {
+			t.Fatal(err)
+		}
+		reports = append(reports, rep)
+
+		data, _ := os.ReadFile(tracePath)
+		var entry struct {
+			Status    int  `json:"status"`
+			FromCache bool `json:"from_cache"`
+		}
+		if err := json.Unmarshal(data, &entry); err != nil {
+			t.Fatalf("trace %s: %v", data, err)
+		}
+		if wantCache := run == 1; entry.FromCache != wantCache {
+			t.Errorf("run %d: trace = %s", run, data)
+		}
+	}
+	if !reflect.DeepEqual(reports[0].Repos, reports[1].Repos) {
+		t.Fatalf("reports differ: %+v vs %+v", reports[0].Repos, reports[1].Repos)
 	}
 }

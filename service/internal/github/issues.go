@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"sort"
 	"time"
 
 	"ghreport/internal/config"
@@ -18,28 +19,57 @@ type Query struct {
 	Since time.Time // нулевое значение — без фильтра
 }
 
-// ListIssues возвращает открытые issue репозитория, отсортированные по
-// created_at, затем по number.
+// ListIssues возвращает открытые issue репозитория (без PR), созданные не
+// раньше q.Since, не более q.Limit штук, отсортированные по created_at, затем
+// по number. Страницы запрашиваются последовательно; следующая берётся только
+// из заголовка Link с rel="next".
 func (c *Client) ListIssues(ctx context.Context, repo config.Repo, q Query) ([]report.Issue, error) {
-	pageURL := c.issuesURL(repo)
-	resp, _, err := c.get(ctx, pageURL)
-	if err != nil {
-		return nil, err
-	}
-	items, err := decodePage(resp.body)
-	if err != nil {
-		return nil, errorf(CodeInvalidResponse, "%s: %v", pageURL, err)
-	}
-
-	issues := make([]report.Issue, 0, len(items))
-	for _, it := range items {
-		if it.pullRequest {
-			continue
-		}
-		issues = append(issues, it.Issue)
-		if len(issues) == q.Limit {
+	var (
+		collected []item
+		seenNums  = make(map[int64]bool)
+		seenPages = make(map[string]bool)
+	)
+	next := c.issuesURL(repo)
+	for next != "" && len(collected) < q.Limit {
+		if seenPages[next] {
+			c.logf("%s: Link снова указывает на %s, обход страниц остановлен", repo, next)
 			break
 		}
+		seenPages[next] = true
+
+		resp, final, err := c.get(ctx, next)
+		if err != nil {
+			return nil, err
+		}
+		items, err := decodePage(resp.body)
+		if err != nil {
+			return nil, errorf(CodeInvalidResponse, "%s: %v", final, err)
+		}
+		for _, it := range items {
+			if it.pullRequest || seenNums[it.Number] || it.created.Before(q.Since) {
+				continue
+			}
+			seenNums[it.Number] = true
+			collected = append(collected, it)
+			if len(collected) == q.Limit {
+				break
+			}
+		}
+		if next, err = nextLink(resp.header, final); err != nil {
+			return nil, errorf(CodeInvalidResponse, "%s: %v", final, err)
+		}
+	}
+
+	sort.SliceStable(collected, func(i, j int) bool {
+		a, b := collected[i], collected[j]
+		if !a.created.Equal(b.created) {
+			return a.created.Before(b.created)
+		}
+		return a.Number < b.Number
+	})
+	issues := make([]report.Issue, len(collected))
+	for i, it := range collected {
+		issues[i] = it.Issue
 	}
 	return issues, nil
 }
