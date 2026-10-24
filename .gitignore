@@ -1,0 +1,20 @@
+# Сборка C++
+build/
+build-*/
+cmake-build-*/
+
+# ghreport
+.ghreport-cache/
+service/ghreport
+/ghreport
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# Редакторы и ОС
+.DS_Store
+.idea/
+.vscode/
