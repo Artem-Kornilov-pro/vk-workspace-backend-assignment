@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"ghreport/internal/cache"
 	"ghreport/internal/config"
 	"ghreport/internal/github"
 	"ghreport/internal/report"
@@ -44,6 +45,11 @@ func Run(ctx context.Context, args []string, getenv func(string) string, stdout,
 		return usageError(stderr, err)
 	}
 
+	store, err := cache.Open(cfg.CacheDir)
+	if err != nil {
+		return usageError(stderr, fmt.Errorf("--cache-dir: %v", err))
+	}
+
 	var journal *trace.Writer
 	if cfg.Trace != "" {
 		f, err := os.Create(cfg.Trace)
@@ -57,6 +63,7 @@ func Run(ctx context.Context, args []string, getenv func(string) string, stdout,
 	client := github.NewClient(github.Options{
 		BaseURL: cfg.BaseURL,
 		Token:   cfg.Token,
+		Cache:   store,
 		Trace:   journal,
 		Logf: func(format string, args ...any) {
 			fmt.Fprintf(stderr, "ghreport: "+format+"\n", args...)
