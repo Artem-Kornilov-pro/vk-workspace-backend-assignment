@@ -3,13 +3,15 @@ add_executable(msgfmt_tests
   test_chars.cpp
   test_escape.cpp
   test_json.cpp
+  test_parse.cpp
   test_utf.cpp
 )
 target_link_libraries(msgfmt_tests PRIVATE msgfmt_core)
 
-foreach(suite IN ITEMS chars escape json utf)
+foreach(suite IN ITEMS chars escape json parse utf)
   add_test(NAME unit.${suite} COMMAND msgfmt_tests ${suite})
 endforeach()
+set_tests_properties(unit.parse PROPERTIES TIMEOUT 120)
 
 # CLI-тест: cli/<name>.in подаётся на stdin, stdout сравнивается с cli/<name>.out,
 # код возврата — с expected_code. Дополнительные аргументы передаются msgfmt.
@@ -27,6 +29,8 @@ endfunction()
 msgfmt_cli_test(format_empty 0)
 msgfmt_cli_test(format_plain 0)
 msgfmt_cli_test(format_invalid_utf8 2)
+msgfmt_cli_test(format_nested 0)
+msgfmt_cli_test(format_link_emoji 0)
 msgfmt_cli_test(escape_example 0 escape)
 msgfmt_cli_test(escape_all_service 0 escape)
 msgfmt_cli_test(escape_empty 0 escape)
